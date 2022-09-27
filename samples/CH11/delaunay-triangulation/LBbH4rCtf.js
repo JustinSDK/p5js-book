@@ -1,0 +1,247 @@
+let points = [];
+let delaunay;
+
+function setup() {
+  createCanvas(300, 300);
+  delaunay = new Delaunay(width, height);
+  stroke(255, 0, 0);
+}
+
+function draw() {
+  background(200);
+
+  // 繪製三角形
+  strokeWeight(1);
+  delaunay.verticesOfTriangles().forEach(triangle => {
+    beginShape();
+    triangle.forEach(p => vertex(p.x, p.y));
+    endShape(CLOSE);
+  });
+
+  // 繪製頂點
+  strokeWeight(5);
+  points.forEach(p => point(p));
+}
+
+// 滑鼠點選時新增頂點
+function mousePressed() {
+  const p = createVector(mouseX, mouseY);
+  points.push(p);
+  delaunay.addPoint(p);
+}
+
+// 求三角形的同心圓的圓心、半徑
+function circumcircle(triangle) {
+  // triangle 是逆時針頂點順序
+  const [p1, p2, p3] = triangle;
+  const v1 = p5.Vector.sub(p2, p1);
+  const v2 = p5.Vector.sub(p3, p2);
+  const det = -p5.Vector.cross(v1, v2).z;
+  if(det !== 0) { // 三點不共線，套用公式
+    const d1 = p5.Vector.add(p2, p1).mult(0.5).dot(v1);
+    const d2 = p5.Vector.add(p3, p2).mult(0.5).dot(v2);
+    const x = (d2 * v1.y - d1 * v2.y) / det;
+    const y = (d1 * v2.x - d2 * v1.x) / det;
+    const center = createVector(x, y);   // 圓心
+    const v = p5.Vector.sub(p1, center);
+    // 半徑平方，減少開根號的誤差
+    const rr = v.x * v.x + v.y * v.y;     
+    const radius = sqrt(rr);
+    return {center, radius, rr};
+  }
+  return null; // 三點共線，不存在外接圓
+}
+
+// 封裝 Delaunay 三角化的類別
+class Delaunay {
+  // 指定畫布寬高
+  constructor(width, height) {
+    // 畫布中心
+    const center = createVector(width, height).mult(0.5);
+    // 建立一個比畫布大上許多的正方形區域
+    const halfW = max(width, height) * 100;
+    this.coords = [
+      p5.Vector.add(center, createVector(-halfW, -halfW)),
+      p5.Vector.add(center, createVector(-halfW, halfW)),
+      p5.Vector.add(center, createVector(halfW, halfW)),
+      p5.Vector.add(center, createVector(halfW, -halfW)),
+    ];
+
+    // 將正方形劃為兩個三角形，使用頂點索引來代表三角形
+    const t1 = [0, 1, 3];
+    const t2 = [2, 3, 1];
+
+    // 三角形頂點索引 => [依頂點索引順序，各自面對的三角形]（鄰居）
+    this.triangles = new Map();
+    // 三角形頂點索引 => 外接圓
+    this.circles = new Map();
+
+    // t1 頂點 0 面對 t2，另兩個頂點沒有面對的三角形
+    this.triangles.set(t1, [t2, null, null]);
+
+    // t2 頂點 0 面對 t1，另兩個頂點沒有面對的三角形
+    this.triangles.set(t2, [t1, null, null]);
+
+    // 設定初始的兩個外接圓
+    this.circles.set(t1, circumcircle(t1.map(i => this.coords[i])));
+    this.circles.set(t2, circumcircle(t2.map(i => this.coords[i])));
+  }
+  // 加入新點 p
+  addPoint(p) {
+    // 新頂點索引
+    const idx = this.coords.length;
+    // 新頂點
+    this.coords.push(p);
+
+    // 既有的三角形外接圓若包含 p，收集在 badTriangles
+    const badTriangles = delaunayBadTriangles(this, p);
+
+    // 找出不合格三角形的邊（不含共用邊）
+    const boundary = delaunayBoundary(this, badTriangles);
+
+    // 刪除不合格的三角形以及外接圓
+    badTriangles.forEach(tri => {
+      this.triangles.delete(tri);
+      this.circles.delete(tri);
+    });
+
+    // 用收集的邊建立新三角形
+    const newTriangles = boundary.map(b => {
+      return {
+        t: [idx, b.edge[0], b.edge[1]], // 新三角形頂點索引
+        edge: b.edge, // 用哪個邊建立
+        delaunayTri: b.delaunayTri, // 該邊接著這個三角形
+      };
+    });
+    
+    // 將新三角形加入Delaunay的triangles特性，並新增外接圓
+    addTo(this, newTriangles);
+
+    // 調整新三角形與既有的 Delaunay 三角鄰接關係
+    adjustNeighbors(this, newTriangles);
+  }
+
+  // 匯出各個三角形的頂點座標
+  verticesOfTriangles() {
+    return Array.from(this.triangles.keys())
+      .filter(tri => tri[0] > 3 && tri[1] > 3 && tri[2] > 3)
+      .map(tri => [
+        this.coords[tri[0]],
+        this.coords[tri[1]],
+        this.coords[tri[2]],
+      ]);
+  }
+
+  // 三角形頂點索引
+  indicesOfTriangles() {
+      return Array.from(this.triangles.keys())
+              .filter(tri => tri[0] > 3 && tri[1] > 3 && tri[2] > 3)
+              // 基於客戶端新增頂點順序的索引
+              .map(tri => [tri[0] - 4, tri[1] - 4, tri[2] - 4]);
+  }
+}
+
+// 指定 Delaunay 實例與點座標，收集不合格三角形
+function delaunayBadTriangles(delaunay, p) {
+  return Array
+          .from(delaunay.triangles.keys()) // 目前每個三角形
+          .filter(tri => inCircumcircle(tri, p, delaunay.circles)); // 被外接圓涵蓋
+}
+
+// 點是否在 triangle 的外接圓
+function inCircumcircle(triangle, p, circles) {
+  const c = circles.get(triangle); // 取得外接圓
+  // 以半徑平方比較
+  const v = p5.Vector.sub(c.center, p);
+  return v.x * v.x + v.y * v.y <= c.rr;
+}
+
+// 從不合格三角形裡收集非共用的邊
+function delaunayBoundary(delaunay, badTriangles) {
+  const boundary = [];
+
+  // 從任一不合格三角形開始尋找邊，這邊從 0 開始
+  let t = badTriangles[0];
+
+  // vi 是用來走訪鄰接三角形的索引
+  let vi = 0;
+  while(true) {
+    // 取得不合格三角形，第 vi 頂點面對的三角形
+    const opTri = delaunay.triangles.get(t)[vi];
+    // 如果不是不合格三角形
+    if(badTriangles.find((tri) => tri === opTri) === undefined) {
+      boundary.push({
+        // 記錄邊索引，這邊有處理循環與負索引
+        edge: [t[(vi + 1) % 3], t[vi > 0 ? vi - 1 : t.length + vi - 1]],
+        // 記錄 vi 頂點面對的三角形（目前是合格的 delaunay 三角形）
+        delaunayTri: opTri,
+      });
+
+      // 下個頂點索引
+      vi = (vi + 1) % 3;
+
+      // 邊頂點索引有相接了，表示繞行不合格的三角形們一圈了
+      if(boundary[0].edge[0] === boundary[boundary.length - 1].edge[1]) {
+        break;
+      }
+    }
+    // 如果 opTri 也是不合格三角形，不收集邊
+    else {
+      // 共用邊面對的 opTri 頂點
+      const i = delaunay.triangles.get(opTri).findIndex(tri => tri === t);
+
+      // 下個頂點索引
+      vi = (i + 1) % 3;
+      // opTri 也是不合格三角形，用它繼續尋找邊
+      t = opTri;
+    }
+  }
+
+  return boundary;
+}
+
+// 將新三角形加入Delaunay的triangles特性，並新增外接圓
+function addTo(delaunay, newTriangles) {
+  for(let i = 0; i < newTriangles.length; i++) {
+    const {t, _, delaunayTri} = newTriangles[i];
+    // 將新三角形頂點索引加入，記錄三個頂點對邊的三角形
+    delaunay.triangles.set(t, [delaunayTri, null, null]);
+    // 新外接圓
+    delaunay.circles.set(t, circumcircle(t.map(i => delaunay.coords[i]))); 
+  }
+}
+
+// 調整新三角形與既有的 Delaunay 三角鄰接關係
+function adjustNeighbors(delaunay, newTriangles) {
+  // 設定新三角形彼此間的鄰接關係
+  for(let i = 0; i < newTriangles.length; i++) {
+    const t = newTriangles[i].t;
+    delaunay.triangles.get(t)[1] = 
+      newTriangles[(i + 1) % newTriangles.length].t;
+    delaunay.triangles.get(t)[2] =
+      newTriangles[i > 0 ? i - 1 : newTriangles.length + i - 1].t;
+  }
+  
+  // 設定新三角形與 delaunayTri 的鄰居關係
+  for(let i = 0; i < newTriangles.length; i++) {
+    const {t, edge, delaunayTri} = newTriangles[i];
+    if(delaunayTri !== null) {
+      // 三個頂點對邊的三角形就是鄰居
+      const neighbors = delaunay.triangles.get(delaunayTri);
+      // 逐一造訪鄰居
+      for(let i = 0; i < neighbors.length; i++) {
+        const neighbor = neighbors[i];
+        if(
+           // 本來有鄰居
+          neighbor !== null &&         
+          // 鄰居的邊相同
+          neighbor.includes(edge[1]) && 
+          neighbor.includes(edge[0]) 
+        ) {
+          neighbors[i] = t; // delaunayTri 邊上的新鄰居更新為新三角形
+          break;
+        }
+      }
+    }
+  }
+}
